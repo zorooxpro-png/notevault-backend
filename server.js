@@ -1,27 +1,27 @@
 /**
- * NOTEVAULT backend — single file.  Node 18+ · Express · Firebase (Auth + Firestore + Storage) · Razorpay
+ * NOTEVAULT backend — single file.  Node 18+ · Express · Firebase (Auth + Firestore, free Spark plan OK) · Razorpay
  *
  * RENDER:  Web Service · Build: `npm install` · Start: `node server.js` · Health check path: /healthz
  *
  * ENV VARS
  *   FIREBASE_SERVICE_ACCOUNT   service-account JSON (raw, or base64 of it)
- *   FIREBASE_STORAGE_BUCKET    e.g. your-project.firebasestorage.app  (or your-project.appspot.com)
  *   RAZORPAY_KEY_ID            rzp_test_… / rzp_live_…
  *   RAZORPAY_KEY_SECRET
  *   RAZORPAY_WEBHOOK_SECRET    secret you set on the webhook in the Razorpay dashboard
  *   ADMIN_EMAILS               comma-separated admin emails (must be verified in Firebase Auth)
  *   ALLOWED_ORIGINS            comma-separated site origins for CORS, e.g. https://notevault.netlify.app (empty = allow all)
- *   MAX_PDF_MB                 optional, default 25
+ *   MAX_PDF_MB                 optional, default 10 (PDFs are stored inside Firestore, so keep them modest)
  *
  * RAZORPAY WEBHOOK: URL https://<your-service>.onrender.com/api/webhooks/razorpay · events: payment.captured, order.paid
- * FIREBASE RULES:  this server is the only client of Firestore/Storage → set both rules to `allow read, write: if false;`
+ * FIREBASE RULES:  this server is the only client of Firestore → set its rules to `allow read, write: if false;`
+ * PDFs: no Firebase Storage needed — each PDF is split into ~700 KB chunks in Firestore (pdfs/{productId}/c/*) and streamed to buyers.
  *
  * AUTH: clients send `Authorization: Bearer <Firebase ID token>`.
  *
  * PUBLIC   GET  /healthz · /api/config · /api/products · /api/products/:id
  * USER     POST /api/orders {productIds[]}            → starts Razorpay checkout (free items are granted instantly)
  *          POST /api/orders/verify {razorpay_*}       → verifies signature, unlocks notes
- *          GET  /api/orders/mine · /api/library · /api/library/:productId/download   (5-minute signed PDF link)
+ *          GET  /api/orders/mine · /api/library · /api/library/:productId/download   (returns the PDF bytes; fetch with the Bearer token and save as a blob)
  * ADMIN    GET  /api/admin/stats · /api/admin/products · /api/admin/orders
  *          POST /api/admin/products   (multipart: `data` JSON + `pdf` file)   PUT /api/admin/products/:id   DELETE /api/admin/products/:id[?force=1]
  *          POST /api/admin/import     (JSON array exported from the old browser-only admin panel)
@@ -50,16 +50,15 @@ function serviceAccount() {
   if (j.private_key) j.private_key = j.private_key.replace(/\\n/g, "\n");
   return j;
 }
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount()), storageBucket: need("FIREBASE_STORAGE_BUCKET") });
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount()) });
 const db = admin.firestore();
 db.settings({ ignoreUndefinedProperties: true });
-const bucket = admin.storage().bucket();
 const RZP_KEY = need("RAZORPAY_KEY_ID"), RZP_SECRET = need("RAZORPAY_KEY_SECRET");
 const rzp = new Razorpay({ key_id: RZP_KEY, key_secret: RZP_SECRET });
 const WEBHOOK_SECRET = env.RAZORPAY_WEBHOOK_SECRET || "";
 const ADMINS = (env.ADMIN_EMAILS || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 const ORIGINS = (env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim().replace(/\/$/, "")).filter(Boolean);
-const MAX_PDF_MB = +env.MAX_PDF_MB || 25;
+const MAX_PDF_MB = +env.MAX_PDF_MB || 10;
 if (!ADMINS.length) console.warn("ADMIN_EMAILS is empty — admin routes will reject everyone.");
 if (!ORIGINS.length) console.warn("ALLOWED_ORIGINS is empty — CORS allows any origin.");
 if (!WEBHOOK_SECRET) console.warn("RAZORPAY_WEBHOOK_SECRET is empty — webhook disabled (clients must call /api/orders/verify).");
@@ -97,15 +96,28 @@ function cleanProduct(b) {
   if (!(p.mrp > p.price)) p.mrp = null;
   return p;
 }
-const out = (id, d) => { const { pdfPath, ...rest } = d; return { id, ...rest, hasPdf: !!pdfPath }; };
+const out = (id, d) => { const { pdfChunks, pdfVer, ...rest } = d; return { id, ...rest, hasPdf: !!pdfChunks }; };
 const orderOut = o => ({ id: o.id, uid: o.email, email: o.email, items: (o.items || []).map(({ id, title, price }) => ({ id, title, price })), total: o.total, status: o.status, at: o.paidAt || o.createdAt, paymentId: o.paymentId || null, razorpayOrderId: o.razorpayOrderId || null });
 
+const CHUNK = 700 * 1024; // Firestore documents max out at 1 MiB
+const chunksRef = id => col("pdfs").doc(id).collection("c");
+async function deleteChunks(id, pred) {
+  const refs = (await chunksRef(id).listDocuments()).filter(pred);
+  for (let i = 0; i < refs.length; i += 400) { const b = db.batch(); refs.slice(i, i + 400).forEach(r => b.delete(r)); await b.commit(); }
+}
 async function savePdf(id, buf, name) {
   if (!buf || buf.length < 5 || buf.subarray(0, 5).toString("latin1") !== "%PDF-") throw bad("File is not a valid PDF");
   if (buf.length > MAX_PDF_MB * 1048576) throw bad(`PDF too large (max ${MAX_PDF_MB} MB)`, 413);
-  const pdfPath = `pdfs/${id}.pdf`;
-  await bucket.file(pdfPath).save(buf, { contentType: "application/pdf", resumable: false });
-  return { pdfPath, pdfName: str(name, 120) || "notes.pdf", pdfSize: buf.length };
+  const ver = Date.now().toString(36), n = Math.ceil(buf.length / CHUNK), mine = r => r.id.startsWith(ver + "_");
+  try {
+    for (let i = 0; i < n; i += 6) { // small batches keep each commit well under Firestore's 10 MiB request limit
+      const b = db.batch();
+      for (let k = i; k < Math.min(n, i + 6); k++) b.set(chunksRef(id).doc(`${ver}_${String(k).padStart(4, "0")}`), { data: Buffer.from(buf.subarray(k * CHUNK, (k + 1) * CHUNK)) });
+      await b.commit();
+    }
+  } catch (e) { await deleteChunks(id, mine).catch(() => {}); throw e; }
+  await deleteChunks(id, r => !mine(r)).catch(e => console.error("Old PDF cleanup failed:", e)); // old version removed only after the new one is safely written
+  return { pdfVer: ver, pdfChunks: n, pdfName: str(name, 120) || "notes.pdf", pdfSize: buf.length };
 }
 
 /** Marks an order paid and unlocks its items. Safe to call repeatedly (checkout verify + webhook). */
@@ -254,10 +266,13 @@ app.get("/api/library/:id/download", auth, wrap(async (req, res) => {
   const [own, prod] = await db.getAll(col("purchases").doc(`${req.user.uid}_${req.params.id}`), col("products").doc(req.params.id));
   if (!own.exists) throw bad("You have not purchased this note", 403);
   const p = prod.exists && prod.data();
-  if (!p || !p.pdfPath) throw bad("File not available yet", 404);
+  if (!p || !p.pdfChunks) throw bad("File not available yet", 404);
+  const snap = await chunksRef(prod.id).get();
+  const parts = snap.docs.filter(d => d.id.startsWith(p.pdfVer + "_")).sort((x, y) => (x.id < y.id ? -1 : 1));
+  if (parts.length !== p.pdfChunks) throw bad("File is being updated, try again shortly", 503);
   const name = (p.title || "notes").replace(/[^\w\- ]+/g, "").trim().slice(0, 60) || "notes";
-  const [url] = await bucket.file(p.pdfPath).getSignedUrl({ version: "v4", action: "read", expires: Date.now() + 5 * 60 * 1000, responseDisposition: `attachment; filename="${name}.pdf"` });
-  res.json({ url, expiresIn: 300 });
+  res.set({ "Content-Type": "application/pdf", "Content-Disposition": `attachment; filename="${name}.pdf"`, "Cache-Control": "private, no-store" });
+  res.end(Buffer.concat(parts.map(d => d.get("data"))));
 }));
 
 /* ---------- admin ---------- */
@@ -281,10 +296,10 @@ app.put("/api/admin/products/:id", ...adm, upload.single("pdf"), wrap(async (req
   if (!cur.exists) throw bad("Not found", 404);
   const raw = body(req), p = cleanProduct(raw), upd = { ...p, updatedAt: Date.now() };
   if (req.file) Object.assign(upd, await savePdf(ref.id, req.file.buffer, req.file.originalname));
-  else if (raw.removePdf === true && cur.data().pdfPath) {
-    await bucket.file(cur.data().pdfPath).delete({ ignoreNotFound: true });
+  else if (raw.removePdf === true && cur.data().pdfChunks) {
+    await deleteChunks(ref.id, () => true);
     const del = admin.firestore.FieldValue.delete();
-    Object.assign(upd, { pdfPath: del, pdfName: del, pdfSize: del });
+    Object.assign(upd, { pdfChunks: del, pdfVer: del, pdfName: del, pdfSize: del });
   }
   await ref.update(upd);
   const fresh = await ref.get();
@@ -296,7 +311,7 @@ app.delete("/api/admin/products/:id", ...adm, wrap(async (req, res) => {
   if (!cur.exists) throw bad("Not found", 404);
   const sold = await col("purchases").where("productId", "==", ref.id).limit(1).get();
   if (!sold.empty && req.query.force !== "1") throw bad("This note has buyers — unpublish it instead, or add ?force=1 to delete anyway", 409);
-  if (cur.data().pdfPath) await bucket.file(cur.data().pdfPath).delete({ ignoreNotFound: true });
+  if (cur.data().pdfChunks) await deleteChunks(ref.id, () => true);
   await ref.delete();
   res.json({ ok: true });
 }));
@@ -311,7 +326,7 @@ app.get("/api/admin/stats", ...adm, wrap(async (req, res) => {
   const P = ps.docs.map(d => d.data()), O = os.docs.map(d => d.data()), sales = {};
   O.forEach(o => o.items.forEach(i => sales[i.id] = (sales[i.id] || 0) + 1));
   res.json({
-    products: P.length, published: P.filter(p => p.status !== "draft").length, drafts: P.filter(p => p.status === "draft").length, withPdf: P.filter(p => p.pdfPath).length,
+    products: P.length, published: P.filter(p => p.status !== "draft").length, drafts: P.filter(p => p.status === "draft").length, withPdf: P.filter(p => p.pdfChunks).length,
     orders: O.length, revenue: O.reduce((a, o) => a + o.total, 0),
     bestSellers: Object.entries(sales).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([id, n]) => ({ id, title: ps.docs.find(d => d.id === id)?.data().title || id, sales: n }))
   });
