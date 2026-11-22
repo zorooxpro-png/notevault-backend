@@ -61,7 +61,7 @@ const MAX_PDF_MB = +env.MAX_PDF_MB || 10;
 if (!ADMINS.length) console.warn("ADMIN_EMAILS is empty — admin routes will reject everyone.");
 if (!ORIGINS.length) console.warn("ALLOWED_ORIGINS is empty — CORS allows any origin.");
 
-const BOARDS = ["CBSE", "ICSE", "State Board"], SUBJ = ["Mathematics", "Science", "Physics", "Chemistry", "Biology", "English", "Social Science"], LANGS = ["English", "Malayalam", "Bilingual"];
+const BOARDS = ["CBSE", "ICSE", "State Board"], SUBJ = ["Mathematics","Science","Social Science","History","Geography","Civics","English","Hindi","Sanskrit","Malayalam","Computer Science","Physics","Chemistry","Biology","Political Science","Economics","Information Technology","Artificial Intelligence","Informatics Practices","Physical Education","Accountancy","Business Studies","Psychology","Sociology","Applied Mathematics","Entrepreneurship","Legal Studies","Home Science","Biotechnology","English Language","English Literature","History & Civics","Computer Applications","Economic Applications","Commercial Studies","Environmental Science","Accounts","Commerce","Arabic","Urdu","Botany","Zoology","Computer Application","Statistics","Social Work","Journalism","Gandhian Studies","Philosophy","Electronics","Music"], LANGS = ["English", "Malayalam", "Hindi", "Bilingual"];
 const col = n => db.collection(n);
 
 /* ---------- helpers ---------- */
