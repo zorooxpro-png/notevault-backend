@@ -10,6 +10,8 @@
  *   ADMIN_EMAILS               comma-separated admin emails (must be verified in Firebase Auth)
  *   ALLOWED_ORIGINS            comma-separated site origins for CORS, e.g. https://notevault.netlify.app (empty = allow all)
  *   MAX_PDF_MB                 optional, default 10 (PDFs are stored inside Firestore, so keep them modest)
+ *   REFERRAL_CONFIG            optional JSON to change referral rewards without editing code, e.g.
+ *                              {"percent":10,"welcomePercent":10,"milestones":{"3":{"freeProducts":1},"5":{"freeProducts":2}}}
  *
  * PAYMENT FLOW (no gateway, so no KYC): buyer pays your UPI ID with the order's reference code as the note, then submits the
  * 12-digit UPI reference (UTR). The order waits as "pending" until an admin checks the money in their UPI app and approves it.
@@ -21,13 +23,15 @@
  * AUTH: clients send `Authorization: Bearer <Firebase ID token>`.
  *
  * PUBLIC   GET  /healthz · /api/config · /api/products · /api/products/:id
- * USER     POST /api/orders {productIds[]}            → creates an order, returns amount + UPI link (free items are granted instantly)
+ * USER     POST /api/orders {productIds[], coupon?}   → creates an order, returns amount + UPI link (free items are granted instantly)
  *          POST /api/orders/:id/submit {utr}          → buyer submits the 12-digit UPI reference; order becomes "pending"
  *          GET  /api/orders/mine · /api/library · /api/library/:productId/download   (returns the PDF bytes; fetch with the Bearer token and save as a blob)
  * ADMIN    GET  /api/admin/stats · /api/admin/products · /api/admin/orders[?status=pending]
  *          POST /api/admin/products   (multipart: `data` JSON + `pdf` file)   PUT /api/admin/products/:id   DELETE /api/admin/products/:id[?force=1]
  *          POST /api/admin/import     (JSON array exported from the old browser-only admin panel)
  *          POST /api/admin/orders/:id/approve · /reject {reason?} · /revoke
+ * REFERRALS (referrals.js)  GET /api/referrals/config · /validate?code= · /me   POST /api/referrals/apply {code} · /quote {productIds[]}
+ *          ADMIN  GET /api/admin/referrals
  */
 "use strict";
 const crypto = require("crypto");
@@ -37,6 +41,7 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const multer = require("multer");
 const admin = require("firebase-admin");
+const createReferrals = require("./referrals");
 
 /* ---------- config ---------- */
 const env = process.env;
@@ -94,7 +99,7 @@ function cleanProduct(b) {
   return p;
 }
 const out = (id, d) => { const { pdfChunks, pdfVer, ...rest } = d; return { id, ...rest, hasPdf: !!pdfChunks }; };
-const orderOut = o => ({ id: o.id, uid: o.email, email: o.email, items: (o.items || []).map(({ id, title, price }) => ({ id, title, price })), total: o.total, status: o.status, at: o.paidAt || o.submittedAt || o.createdAt, ref: o.ref || null, utr: o.utr || null, rejectReason: o.rejectReason || null });
+const orderOut = o => ({ id: o.id, uid: o.email, email: o.email, items: (o.items || []).map(({ id, title, price }) => ({ id, title, price })), subtotal: o.subtotal ?? o.total, discount: o.discount || 0, coupon: o.coupon || null, total: o.total, status: o.status, at: o.paidAt || o.submittedAt || o.createdAt, ref: o.ref || null, utr: o.utr || null, rejectReason: o.rejectReason || null });
 
 const CHUNK = 700 * 1024; // Firestore documents max out at 1 MiB
 const chunksRef = id => col("pdfs").doc(id).collection("c");
@@ -142,6 +147,16 @@ async function readUser(req) {
 const softAuth = wrap(async (req, res, next) => { req.user = await readUser(req); next(); });
 const auth = wrap(async (req, res, next) => { req.user = await readUser(req); if (!req.user) throw bad("Sign in required", 401); next(); });
 const adminOnly = (req, res, next) => isAdmin(req.user) ? next() : next(bad("Admin only", 403));
+
+/* ---------- referrals ---------- */
+let referralConfig = {};
+try { referralConfig = env.REFERRAL_CONFIG ? JSON.parse(env.REFERRAL_CONFIG) : {}; } catch { console.error("REFERRAL_CONFIG is not valid JSON"); process.exit(1); }
+const referrals = createReferrals({
+  db, admin,
+  requireAuth: auth,                              // same Firebase-token auth as the rest of the API (sets req.user)
+  isAdmin: async req => isAdmin(req.user),        // same verified-admin rule as the rest of the API
+  config: { ...referralConfig, orderFields: { uid: "uid", status: "status", amount: "total", at: "paidAt" } },
+});
 
 /* ---------- app ---------- */
 const app = express();
@@ -207,11 +222,21 @@ app.post("/api/orders", rateLimit({ windowMs: 15 * 60 * 1000, limit: 40 }), auth
     if (!owned[k].exists) items.push({ id: d.id, title: d.data().title, price: d.data().price });
   });
   if (!items.length) throw bad("You already own these notes", 409);
-  const total = items.reduce((a, i) => a + i.price, 0), ref = col("orders").doc(), code = refCode();
-  await ref.set({ uid, email: email || "", items, total, currency: "INR", ref: code, status: "created", createdAt: Date.now() });
-  if (total === 0) return res.json({ free: true, order: orderOut(await fulfil(ref.id)) });
+  const ref = col("orders").doc(), code = refCode();
+  let pricing; // { subtotal, discount, total, couponCode } — reserves the coupon for this order atomically
+  try { pricing = await referrals.priceOrder({ uid, orderId: ref.id, items, coupon: req.body?.coupon }); }
+  catch (e) { if (e instanceof referrals.RefError) throw bad(e.message, e.status); throw e; }
+  const total = pricing.total;
+  try {
+    await ref.set({ uid, email: email || "", items, subtotal: pricing.subtotal, discount: pricing.discount, coupon: pricing.couponCode || null, freeUnits: pricing.freeUnits || 0, total, currency: "INR", ref: code, status: "created", createdAt: Date.now() });
+  } catch (e) { if (pricing.couponCode) await referrals.releaseCoupons(ref.id).catch(() => {}); throw e; }
+  if (total === 0) { // free (or fully rewarded) order: unlock now and settle the coupon right away
+    const paid = await fulfil(ref.id);
+    await referrals.reconcileOrder(ref.id, paid).catch(e => console.error("referral reconcile failed", e.message));
+    return res.json({ free: true, order: orderOut(paid) });
+  }
   res.json({
-    orderId: ref.id, ref: code, amount: total, currency: "INR", upiId: UPI_ID, payeeName: UPI_NAME,
+    orderId: ref.id, ref: code, amount: total, subtotal: pricing.subtotal, discount: pricing.discount, coupon: pricing.couponCode || null, currency: "INR", upiId: UPI_ID, payeeName: UPI_NAME,
     upiLink: `upi://pay?pa=${UPI_ID}&pn=${encodeURIComponent(UPI_NAME)}&am=${total.toFixed(2)}&cu=INR&tn=${code}`,
     items: items.map(i => ({ id: i.id, title: i.title }))
   });
@@ -228,6 +253,8 @@ app.post("/api/orders/:id/submit", auth, wrap(async (req, res) => {
   if (st !== "created" && st !== "rejected") throw bad("This order can no longer be paid", 409);
   const dup = await col("orders").where("utr", "==", utr).limit(1).get();
   if (!dup.empty && dup.docs[0].id !== ref.id) throw bad("This reference number was already used", 409);
+  try { await referrals.confirmOrderCoupon(ref.id, s.data()); } // the reward on this order must still be reserved for it
+  catch (e) { if (e instanceof referrals.RefError) throw bad(e.message, e.status); throw e; }
   await ref.update({ status: "pending", utr, submittedAt: Date.now(), rejectReason: admin.firestore.FieldValue.delete() });
   res.json({ ok: true, status: "pending" });
 }));
@@ -337,6 +364,9 @@ app.post("/api/admin/orders/:id/revoke", ...adm, wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+/* ---------- referrals routes (/api/referrals/*, /api/admin/referrals) ---------- */
+app.use(referrals.router);
+
 /* ---------- errors ---------- */
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
 app.use((err, req, res, next) => {
@@ -348,4 +378,4 @@ app.use((err, req, res, next) => {
   res.status(status).json({ error: status >= 500 && !(err instanceof HttpError) ? "Server error" : err.message });
 });
 
-app.listen(env.PORT || 10000, "0.0.0.0", () => console.log(`NOTEVAULT backend listening on ${env.PORT || 10000}`));
+app.listen(env.PORT || 10000, "0.0.0.0", () => { console.log(`NOTEVAULT backend listening on ${env.PORT || 10000}`); referrals.start(); }); // start(): auto-tracks approvals / rejections / revokes
