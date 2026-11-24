@@ -23,6 +23,7 @@
  * AUTH: clients send `Authorization: Bearer <Firebase ID token>`.
  *
  * PUBLIC   GET  /healthz · /api/config · /api/products · /api/products/:id
+ *          POST /api/track  (first-party analytics beacon: text/plain JSON, always 204, 120/min per IP, 2 KB cap, bots ignored → Firestore `analytics_events`, kept 120 days)
  * USER     POST /api/orders {productIds[], coupon?}   → creates an order, returns amount + UPI link (free items are granted instantly)
  *          POST /api/orders/:id/submit {utr}          → buyer submits the 12-digit UPI reference; order becomes "pending"
  *          GET  /api/orders/mine · /api/library · /api/library/:productId/download   (returns the PDF bytes; fetch with the Bearer token and save as a blob)
@@ -30,6 +31,7 @@
  *          POST /api/admin/products   (multipart: `data` JSON + `pdf` file)   PUT /api/admin/products/:id   DELETE /api/admin/products/:id[?force=1]
  *          POST /api/admin/import     (JSON array exported from the old browser-only admin panel)
  *          POST /api/admin/orders/:id/approve · /reject {reason?} · /revoke
+ *          GET  /api/admin/analytics?days=N   (N clamped 1–90, default 7; visitors, sessions, pages, referrers, devices, countries, recent events)
  * REFERRALS (referrals.js)  GET /api/referrals/config · /validate?code= · /me   POST /api/referrals/apply {code} · /quote {productIds[]}
  *          ADMIN  GET /api/admin/referrals
  */
@@ -158,6 +160,112 @@ const referrals = createReferrals({
   config: { ...referralConfig, orderFields: { uid: "uid", status: "status", amount: "total", at: "paidAt" } },
 });
 
+/* ---------- analytics (helpers) ---------- */
+const DAY = 86400000, IST = 330 * 60000, ANALYTICS_TTL = 120 * DAY, ANALYTICS_LIMIT = 20000;
+const EVENTS = new Set(["pageview", "signup", "login", "checkout_start", "order_submitted", "order_free", "download", "leave"]);
+const BOT_RE = /bot|crawl|spider|slurp|headless|phantom|lighthouse|pagespeed|gtmetrix|pingdom|uptime|monitor|scrape|preview|curl|wget|python|axios|fetch|httpclient|go-http|java\/|libwww/i;
+const plain = (v, max) => str(v, max).replace(/[\u0000-\u001f\u007f<>]/g, "");   // no control chars / angle brackets in anything we store
+const tok = (v, min) => { const s = str(v, 64); return s.length >= min && /^[\w-]+$/.test(s) ? s : null; };
+const hostOf = u => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return ""; } };
+const istDay = t => new Date(t + IST).toISOString().slice(0, 10);               // YYYY-MM-DD in Asia/Kolkata (fixed +05:30, no DST)
+const countryOf = h => [h["cf-ipcountry"], h["x-vercel-ip-country"]].map(v => String(v || "").toUpperCase()).find(c => /^[A-Z]{2}$/.test(c) && c !== "XX" && c !== "T1") || null;
+const cleanRef = (v, self) => { const s = plain(v, 200); if (!s) return null; const h = hostOf(s); return h === self && h ? null : h || s.slice(0, 100); }; // URL → host; own site isn't a referrer
+
+function parseUA(ua, w) {
+  const has = r => r.test(ua);
+  const browser = has(/Edg(?:e|A|iOS)?\//) ? "Edge" : has(/OPR\/|OPiOS|Opera/) ? "Opera" : has(/SamsungBrowser/) ? "Samsung Internet" : has(/Instagram/) ? "Instagram" : has(/FBAN|FBAV/) ? "Facebook"
+    : has(/FxiOS|Firefox\//) ? "Firefox" : has(/UCBrowser/) ? "UC Browser" : has(/CriOS|Chrome\//) ? "Chrome" : has(/Safari\//) ? "Safari" : has(/MSIE|Trident\//) ? "IE" : "Other";
+  const os = has(/Windows/) ? "Windows" : has(/Android/) ? "Android" : has(/iPhone|iPad|iPod/) ? "iOS" : has(/Mac OS X|Macintosh/) ? "macOS" : has(/CrOS/) ? "ChromeOS" : has(/Linux|X11/) ? "Linux" : "Other";
+  let device = has(/iPad|Tablet/) || (has(/Android/) && !has(/Mobile/)) ? "tablet" : has(/Mobi|iPhone|iPod|Android/) ? "mobile" : "desktop";
+  if (device === "desktop" && w) device = w < 768 ? "mobile" : os === "macOS" && w < 1100 ? "tablet" : "desktop"; // iPadOS reports a Mac UA; viewport width settles it
+  return { browser, os, device };
+}
+
+/** Validates a beacon request and returns the Firestore document to store, or null to silently drop it. */
+function trackEvent(req) {
+  const origin = req.headers.origin, ua = String(req.headers["user-agent"] || "").slice(0, 400);
+  if (!ua || BOT_RE.test(ua) || (origin && ORIGINS.length && !ORIGINS.includes(origin))) return null;
+  let b; try { b = JSON.parse(req.body); } catch { return null; }
+  const type = str(b?.type, 20), vid = tok(b?.vid, 6);
+  if (!EVENTS.has(type) || !vid) return null;
+  const w = int(b.w, 1, 10000), lang = str(b.lang, 20).toLowerCase(), email = str(b.email, 254).toLowerCase();
+  const ev = {
+    type, vid, sid: tok(b.sid, 6), path: plain(b.path, 200).split("?")[0], ref: cleanRef(b.ref, hostOf(origin)), w,
+    lang: /^[a-z]{2,3}(-[a-z0-9]{2,8})*$/.test(lang) ? lang : null,
+    email: /^[^\s@]{1,64}@[^\s@]+\.[^\s@]{2,}$/.test(email) ? email : null,
+    dur: int(b.dur, 0, 86400), pages: int(b.pages, 0, 1000), pid: tok(b.pid, 1), amt: int(b.amt, 0, 1000000),
+    ...parseUA(ua, w), country: countryOf(req.headers), at: Date.now()   // the IP and the raw user-agent are never stored
+  };
+  return Object.fromEntries(Object.entries(ev).filter(([, v]) => v !== null && v !== ""));
+}
+
+/** Turns raw events (newest first) into the dashboard payload. Visitors/sessions/pages/devices/… are based on pageviews; `leave` only feeds durations. */
+function analyticsReport(E, days, now) {
+  const keys = Array.from({ length: days }, (_, i) => istDay(now - (days - 1 - i) * DAY)); // today (IST) and the days before it, zeros included
+  const daily = new Map(keys.map(k => [k, { vis: new Set(), views: 0 }]));
+  const vis = new Set(), live = new Set(), sess = new Map(), maxDur = new Map(), pages = new Map(), entry = new Map(), exit = new Map(), refs = new Map();
+  const dim = { devices: new Map(), browsers: new Map(), os: new Map(), countries: new Map() };
+  const n = { signup: 0, login: 0, checkout_start: 0, order_submitted: 0, download: 0 }, recent = [];
+  let views = 0;
+  const bump = (m, k) => m.set(k, (m.get(k) || 0) + 1);
+  const uniq = (m, k, vid) => { if (!m.has(k)) m.set(k, new Set()); m.get(k).add(vid); };
+  for (const e of E) {
+    if (Object.hasOwn(n, e.type)) n[e.type]++;
+    if (e.type !== "leave") {
+      if (e.at >= now - 5 * 60000) live.add(e.vid);
+      if (recent.length < 50) recent.push({ at: e.at, type: e.type, path: e.path || null, vid: e.vid, email: e.email || null, country: e.country || null });
+    }
+    if (e.sid && typeof e.dur === "number") maxDur.set(e.sid, Math.max(maxDur.get(e.sid) ?? 0, e.dur));
+    if (e.type !== "pageview") continue;
+    views++; vis.add(e.vid);
+    const d = daily.get(istDay(e.at)); if (d) { d.vis.add(e.vid); d.views++; }
+    const p = e.path || "(unknown)";
+    if (!pages.has(p)) pages.set(p, { v: 0, u: new Set() });
+    pages.get(p).v++; pages.get(p).u.add(e.vid);
+    uniq(dim.devices, e.device || "Unknown", e.vid); uniq(dim.browsers, e.browser || "Unknown", e.vid);
+    uniq(dim.os, e.os || "Unknown", e.vid); uniq(dim.countries, e.country || "Unknown", e.vid);
+    if (e.sid) {
+      const s = sess.get(e.sid) || { n: 0, first: e, last: e };
+      s.n++; if (e.at <= s.first.at) s.first = e; if (e.at > s.last.at) s.last = e;
+      sess.set(e.sid, s);
+    }
+  }
+  let dsum = 0, dn = 0, single = 0;
+  for (const [sid, s] of sess) {
+    if (maxDur.has(sid)) { dsum += maxDur.get(sid); dn++; }  // sessions that never reported a duration don't drag the average to 0
+    if (s.n === 1) single++;
+    bump(entry, s.first.path || "(unknown)"); bump(exit, s.last.path || "(unknown)"); bump(refs, s.first.ref || "Direct");
+  }
+  const top = (m, max, f) => [...m].map(([k, x]) => f(k, x)).sort((a, b) => b.v - a.v || (a.k < b.k ? -1 : 1)).slice(0, max);
+  const cnt = (k, v) => ({ k, v }), size = (k, s) => ({ k, v: s.size });
+  return {
+    totals: {
+      online: live.size, visitors: vis.size, sessions: sess.size, pageviews: views,
+      avgDuration: dn ? Math.round(dsum / dn) : 0, bounceRate: sess.size ? Math.round(single / sess.size * 1000) / 10 : 0,
+      signups: n.signup, logins: n.login, checkouts: n.checkout_start, orders: n.order_submitted, downloads: n.download
+    },
+    daily: keys.map(k => ({ d: k, visitors: daily.get(k).vis.size, views: daily.get(k).views })),
+    pages: top(pages, 15, (k, p) => ({ k, v: p.v, u: p.u.size })),
+    entry: top(entry, 15, cnt), exit: top(exit, 15, cnt), referrers: top(refs, 15, cnt),
+    devices: top(dim.devices, 10, size), browsers: top(dim.browsers, 10, size), os: top(dim.os, 10, size), countries: top(dim.countries, 10, size),
+    recent
+  };
+}
+
+/** Deletes events older than 120 days (≤ 10,000 per run, so the free-tier delete quota is never at risk). */
+async function pruneAnalytics() {
+  for (let i = 0; i < 25; i++) {
+    const s = await col("analytics_events").where("at", "<", Date.now() - ANALYTICS_TTL).select().limit(400).get();
+    if (s.empty) return;
+    const b = db.batch(); s.docs.forEach(d => b.delete(d.ref)); await b.commit();
+    if (s.size < 400) return;
+  }
+}
+function startAnalyticsCleanup() {
+  const run = () => pruneAnalytics().catch(e => console.error("Analytics cleanup failed:", e.message));
+  setTimeout(run, 60 * 1000).unref(); setInterval(run, DAY).unref();   // once a minute after boot, then daily
+}
+
 /* ---------- app ---------- */
 const app = express();
 app.set("trust proxy", 1);
@@ -165,6 +273,20 @@ app.disable("x-powered-by");
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(cors({ origin: (o, cb) => cb(null, !o || !ORIGINS.length || ORIGINS.includes(o)), allowedHeaders: ["Authorization", "Content-Type"], methods: ["GET", "POST", "PUT", "DELETE"], maxAge: 86400 }));
 app.get("/healthz", (req, res) => res.json({ ok: true }));
+
+// First-party analytics beacon. Mounted before the global /api limiter and the JSON parser: it has its own limits, doesn't use up
+// visitors' API quota, and can only ever answer 204 (rate-limited, oversized, malformed, bot, bad origin — all silently dropped).
+const trackLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, legacyHeaders: false, handler: (req, res) => res.status(204).end() });
+const trackText = express.text({ type: "*/*", limit: "2kb" });
+app.post("/api/track", trackLimiter, (req, res, next) => trackText(req, res, () => next()), (req, res) => {
+  const o = req.headers.origin;
+  if (o && (!ORIGINS.length || ORIGINS.includes(o))) res.set("Access-Control-Allow-Credentials", "true"); // sendBeacon always sends with credentials
+  res.status(204).end();
+  try {
+    const ev = trackEvent(req);
+    if (ev) col("analytics_events").add(ev).catch(e => console.error("Analytics write failed:", e.message));
+  } catch (e) { console.error("Analytics error:", e.message); }
+});
 
 app.use("/api", rateLimit({ windowMs: 15 * 60 * 1000, limit: 600, standardHeaders: true, legacyHeaders: false }));
 
@@ -342,6 +464,19 @@ app.get("/api/admin/stats", ...adm, wrap(async (req, res) => {
   });
 }));
 
+const analyticsCache = new Map(); // days → { t, data } — 30 s, so refreshing the dashboard can't burn the free-tier read quota
+app.get("/api/admin/analytics", ...adm, wrap(async (req, res) => {
+  const q = Math.round(Number(req.query.days)), days = Number.isFinite(q) ? Math.min(90, Math.max(1, q)) : 7, now = Date.now();
+  const hit = analyticsCache.get(days);
+  if (hit && now - hit.t < 30000) return res.json(hit.data);
+  const snap = await col("analytics_events").where("at", ">=", now - days * DAY).orderBy("at", "desc").limit(ANALYTICS_LIMIT)
+    .select("type", "vid", "sid", "path", "ref", "dur", "email", "browser", "os", "device", "country", "at").get();
+  if (snap.size >= ANALYTICS_LIMIT) console.warn(`Analytics: hit the ${ANALYTICS_LIMIT}-event cap for ${days} days — oldest events were left out`);
+  const data = analyticsReport(snap.docs.map(d => d.data()), days, now);
+  analyticsCache.set(days, { t: now, data });
+  res.json(data);
+}));
+
 app.post("/api/admin/orders/:id/approve", ...adm, wrap(async (req, res) => res.json({ ok: true, order: orderOut(await fulfil(req.params.id)) })));
 
 app.post("/api/admin/orders/:id/reject", ...adm, wrap(async (req, res) => {
@@ -378,4 +513,4 @@ app.use((err, req, res, next) => {
   res.status(status).json({ error: status >= 500 && !(err instanceof HttpError) ? "Server error" : err.message });
 });
 
-app.listen(env.PORT || 10000, "0.0.0.0", () => { console.log(`NOTEVAULT backend listening on ${env.PORT || 10000}`); referrals.start(); }); // start(): auto-tracks approvals / rejections / revokes
+app.listen(env.PORT || 10000, "0.0.0.0", () => { console.log(`NOTEVAULT backend listening on ${env.PORT || 10000}`); referrals.start(); startAnalyticsCleanup(); }); // referrals.start(): auto-tracks approvals / rejections / revokes
